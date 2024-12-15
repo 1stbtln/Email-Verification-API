@@ -2,12 +2,36 @@ const express = require('express');
 const { validate: validateEmail } = require('email-validator');
 const dns = require('dns').promises;
 const net = require('net');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const dotenv = require('dotenv');
+
+// Load environment variables
+dotenv.config();
 
 const app = express();
 app.use(express.json());
+app.use(helmet()); // Add security headers
+
+// Rate limiting: max 100 requests per 15 minutes per IP
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: { error: 'Too many requests, please try again later.' },
+});
+app.use(limiter);
 
 // Known hard-to-verify domains
 const knownHardDomains = ['gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'live.com'];
+
+// Middleware to validate API key
+app.use((req, res, next) => {
+  const apiKey = req.headers['x-api-key'];
+  if (!apiKey || apiKey !== process.env.API_KEY) {
+    return res.status(403).json({ error: 'Forbidden: Invalid or missing API key.' });
+  }
+  next();
+});
 
 /**
  * Attempt SMTP-level verification of a mailbox.
@@ -33,8 +57,7 @@ async function verifyMailbox(mxHost, fromEmail, toEmail) {
         const code = parseInt(lastLine.substring(0, 3), 10);
 
         switch (step) {
-          case 0:
-            // Expecting 220
+          case 0: // Expecting 220
             if (code === 220) {
               socket.write('HELO example.com\r\n');
               step++;
@@ -46,8 +69,7 @@ async function verifyMailbox(mxHost, fromEmail, toEmail) {
               buffer = '';
             }
             break;
-          case 1:
-            // After HELO, expecting 250
+          case 1: // After HELO, expecting 250
             if (code === 250) {
               socket.write(`MAIL FROM:<${fromEmail}>\r\n`);
               step++;
@@ -59,8 +81,7 @@ async function verifyMailbox(mxHost, fromEmail, toEmail) {
               buffer = '';
             }
             break;
-          case 2:
-            // After MAIL FROM, expecting 250
+          case 2: // After MAIL FROM, expecting 250
             if (code === 250) {
               socket.write(`RCPT TO:<${toEmail}>\r\n`);
               step++;
@@ -72,8 +93,7 @@ async function verifyMailbox(mxHost, fromEmail, toEmail) {
               buffer = '';
             }
             break;
-          case 3:
-            // RCPT TO response
+          case 3: // RCPT TO response
             if (code === 250) {
               result = { valid: true, reason: 'Mailbox exists (SMTP check passed)' };
             } else {
@@ -83,8 +103,7 @@ async function verifyMailbox(mxHost, fromEmail, toEmail) {
             step++;
             buffer = '';
             break;
-          case 4:
-            // After QUIT, expecting 221
+          case 4: // After QUIT, expecting 221
             if (code === 221) {
               socket.end();
             }
@@ -161,54 +180,36 @@ async function verifyEmail(email, skip_smtp = false) {
 
   // Interpret the results
   if (smtpResult.valid === true) {
-    // Mailbox confirmed
     return { status: 'valid', reason: smtpResult.reason };
   } else {
     if (knownHardDomains.includes(domain)) {
-      // Hard domain: domain valid but mailbox can't be confirmed
       return {
         status: 'unknown',
         reason: `The domain (${domain}) is set up to receive emails (MX records are valid), but the server does not confirm individual mailboxes.`
       };
     } else {
-      // Non-hard domain with failed SMTP check => invalid mailbox
-      return {
-        status: 'invalid',
-        reason: smtpResult.reason
-      };
+      return { status: 'invalid', reason: smtpResult.reason };
     }
   }
 }
 
-// Single email verification endpoint (unchanged logic, just refactored)
+// Single email verification endpoint
 app.post('/verify', async (req, res) => {
   const { email, skip_smtp } = req.body;
-  const result = await verifyEmail(email, skip_smtp);
-  return res.json(result);
+
+  if (!email || typeof email !== 'string') {
+    return res.status(400).json({ error: 'Invalid email input.' });
+  }
+
+  try {
+    const result = await verifyEmail(email, skip_smtp);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error.', details: err.message });
+  }
 });
 
-/**
- * Batch endpoint:
- * POST /verify/batch
- * {
- *   "emails": ["user1@example.com", "user2@gmail.com"],
- *   "skip_smtp": true
- * }
- *
- * Returns:
- * {
- *   "summary": {
- *       "total": <number>,
- *       "valid": <number>,
- *       "invalid": <number>,
- *       "unknown": <number>
- *   },
- *   "results": [
- *       {"email": "...", "status": "...", "reason": "..."},
- *       ...
- *   ]
- * }
- */
+// Batch email verification endpoint
 app.post('/verify/batch', async (req, res) => {
   const { emails, skip_smtp } = req.body;
 
@@ -216,37 +217,44 @@ app.post('/verify/batch', async (req, res) => {
     return res.status(400).json({ error: 'Please provide an array of emails.' });
   }
 
-  // Optional: limit batch size to prevent server overload
   if (emails.length > 1000) {
     return res.status(400).json({ error: 'Batch size limit exceeded (max 1000).' });
   }
 
-  const results = [];
-  let validCount = 0;
-  let invalidCount = 0;
-  let unknownCount = 0;
+  try {
+    const results = [];
+    let validCount = 0;
+    let invalidCount = 0;
+    let unknownCount = 0;
 
-  // Process each email
-  for (const email of emails) {
-    const result = await verifyEmail(email, skip_smtp);
-    results.push({ email, ...result });
+    for (const email of emails) {
+      const result = await verifyEmail(email, skip_smtp);
+      results.push({ email, ...result });
 
-    // Tally counts
-    if (result.status === 'valid') validCount++;
-    else if (result.status === 'invalid') invalidCount++;
-    else if (result.status === 'unknown') unknownCount++;
+      if (result.status === 'valid') validCount++;
+      else if (result.status === 'invalid') invalidCount++;
+      else if (result.status === 'unknown') unknownCount++;
+    }
+
+    const summary = {
+      total: emails.length,
+      valid: validCount,
+      invalid: invalidCount,
+      unknown: unknownCount,
+    };
+
+    return res.json({ summary, results });
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error.', details: err.message });
   }
-
-  const summary = {
-    total: emails.length,
-    valid: validCount,
-    invalid: invalidCount,
-    unknown: unknownCount
-  };
-
-  return res.json({ summary, results });
 });
 
+// Handle undefined routes
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found.' });
+});
+
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Email Verification API is running on port ${PORT}`);
