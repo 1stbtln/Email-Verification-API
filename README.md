@@ -155,7 +155,7 @@ Create a new branch (feature/your-feature-name).
 Submit a pull request.
 Support
 For questions or issues, please create a GitHub issue or contact support at:
-Email: ewagn57dev@gmail.com
+Email: ewag57dev@gmail.com
 
 License
 This project is licensed under the MIT License.
