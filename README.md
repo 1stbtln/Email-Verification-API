@@ -1,4 +1,5 @@
 Batch Email Validation API
+
 Validate multiple email addresses for syntax, domain validity, and optional SMTP mailbox existence.
 Overview
 The Batch Email Validation API allows developers to validate email addresses quickly and efficiently. It checks for:
